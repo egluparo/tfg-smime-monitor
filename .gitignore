@@ -1,0 +1,22 @@
+# Base de datos
+*.db
+*.sqlite
+*.sqlite3
+
+# Claves y certificados privados
+*.p12
+*.pfx
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Datos de n8n
+n8n_data/
+
+# Logs
+*.log

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Asistente S/MIME — luparo.com.ar</title>
+  <style>
+    :root { --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3e; --accent:#4f8ef7; --text:#e2e8f0; --muted:#6b7280; --green:#22c55e; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { background:var(--bg); color:var(--text); font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; min-height:100vh; }
+    header { background:var(--surface); border-bottom:1px solid var(--border); padding:16px 32px; display:flex; align-items:center; gap:12px; }
+    header h1 { font-size:1.2rem; }
+    a.back { color:var(--accent); text-decoration:none; font-size:.85rem; }
+    main { max-width:520px; margin:40px auto; padding:0 16px; width:100%; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:32px; }
+    .card h2 { font-size:1.1rem; margin-bottom:6px; }
+    .card p { font-size:.85rem; color:var(--muted); margin-bottom:24px; }
+    label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:6px; margin-top:16px; }
+    input { width:100%; padding:10px 14px; background:#12151f; border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:.9rem; outline:none; }
+    input:focus { border-color:var(--accent); }
+    button { margin-top:24px; width:100%; padding:12px; background:var(--accent); color:#fff; border:none; border-radius:8px; font-size:1rem; cursor:pointer; font-weight:600; }
+    button:hover { opacity:.9; }
+    .note { margin-top:20px; background:#0a1629; border:1px solid var(--border); border-radius:8px; padding:14px; font-size:.8rem; color:var(--muted); }
+    .note strong { color:var(--text); }
+    .success { margin-top:16px; background:#052e16; border:1px solid #166534; border-radius:8px; padding:14px; font-size:.85rem; color:var(--green); display:none; }
+    .error-msg { margin-top:16px; background:#2d0a0a; border:1px solid #991b1b; border-radius:8px; padding:14px; font-size:.85rem; color:#f87171; display:none; }
+  </style>
+</head>
+<body>
+<header>
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4f8ef7" stroke-width="2">
+    <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+  </svg>
+  <h1>Asistente de Certificados S/MIME</h1>
+  <a class="back" href="/dashboard">← Dashboard</a>
+</header>
+<main>
+  <div class="card">
+    <h2>Paso 1 — Generar clave y certificado</h2>
+    <p>Completá tus datos para generar el par de claves y descargar el certificado .p12 listo para importar en Thunderbird u Outlook.</p>
+
+    <label>Nombre y Apellido (CN) *</label>
+    <input id="cn" type="text" placeholder="Ej: Emiliano Gonzalez Luparo">
+
+    <label>Email *</label>
+    <input id="email" type="email" placeholder="Ej: usuario@luparo.com.ar">
+
+    <label>PIN / Contraseña de clave privada *</label>
+    <input id="pin" type="password" placeholder="Mínimo 8 caracteres">
+
+    <label>Días de validez</label>
+    <input id="days" type="number" value="365" min="30" max="1095">
+
+    <button onclick="generar()">Generar y Descargar Certificado</button>
+
+    <div class="success" id="ok">✔ Certificado generado. La descarga comenzó automáticamente.</div>
+    <div class="error-msg" id="err"></div>
+  </div>
+
+  <div class="note">
+    <strong>¿Qué es el archivo .p12?</strong><br>
+    Contiene tu clave privada y certificado en un solo archivo protegido por PIN. Importalo en Thunderbird desde
+    <em>Ajustes → Privacidad y seguridad → Certificados → Ver certificados → Sus certificados → Importar</em>.
+    Guardá una copia segura y <strong>nunca compartas</strong> el .p12 por correo sin cifrarlo.
+  </div>
+</main>
+<script>
+async function generar() {
+  const cn    = document.getElementById('cn').value.trim();
+  const email = document.getElementById('email').value.trim();
+  const pin   = document.getElementById('pin').value;
+  const days  = document.getElementById('days').value;
+  document.getElementById('ok').style.display  = 'none';
+  document.getElementById('err').style.display = 'none';
+
+  if (!cn || !email || !pin) {
+    const el = document.getElementById('err');
+    el.textContent = 'Completá todos los campos obligatorios.';
+    el.style.display = 'block';
+    return;
+  }
+
+  try {
+    const resp = await fetch('/generar-certificado', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cn, email, pin, days })
+    });
+    if (!resp.ok) {
+      const j = await resp.json().catch(()=>({error:'Error desconocido'}));
+      throw new Error(j.error || resp.statusText);
+    }
+    const blob = await resp.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = cn.replace(/ /g,'_') + '.p12';
+    a.click();
+    document.getElementById('ok').style.display = 'block';
+  } catch(e) {
+    const el = document.getElementById('err');
+    el.textContent = 'Error: ' + e.message;
+    el.style.display = 'block';
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,366 @@
+import os
+import sqlite3
+import json
+import hashlib
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, render_template, send_file, g
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives.serialization import pkcs12
+import io
+
+app = Flask(__name__)
+DB_PATH = os.environ.get("DB_PATH", "/app/data/tfg_security.db")
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc=None):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS CERTIFICADOS (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sujeto_cn TEXT NOT NULL,
+        emisor TEXT NOT NULL,
+        serie TEXT NOT NULL,
+        vence DATE NOT NULL,
+        estado TEXT DEFAULT 'valido',
+        email TEXT,
+        huella_sha256 TEXT,
+        fuente TEXT,
+        UNIQUE(sujeto_cn),
+        UNIQUE(serie)
+    );
+    CREATE TABLE IF NOT EXISTS EVENTOS_CORREO (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        remitente TEXT,
+        destinatario TEXT,
+        msg_id TEXT NOT NULL,
+        fecha_hora DATETIME DEFAULT CURRENT_TIMESTAMP,
+        firmado BOOLEAN DEFAULT 0,
+        firma_valida BOOLEAN DEFAULT 0,
+        cifrado BOOLEAN DEFAULT 0,
+        descifrado_ok BOOLEAN DEFAULT 0,
+        error_codigo TEXT,
+        fuente TEXT,
+        subject TEXT,
+        UNIQUE(msg_id)
+    );
+    """)
+    con.commit()
+    con.close()
+
+# ─────────────────────────────────────────────────────────────
+# Tabla de clasificacion S/MIME por content-type (RFC 8551)
+#
+# TEXTO PLANO:
+#   text/plain                       charset=UTF-8 / charset=iso-8859-1
+#   text/html                        charset=UTF-8
+#   multipart/alternative            correo normal con parte html y texto
+#   multipart/mixed                  correo con adjuntos normales
+#   multipart/related                html con imagenes inline
+#
+# FIRMADO (S/MIME detached — mas comun):
+#   multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256|sha-1|sha-384|sha-512
+#   multipart/signed; protocol="application/x-pkcs7-signature"  (clientes viejos)
+#
+# FIRMADO OPACO (S/MIME signed-data — Outlook legacy, menos comun):
+#   application/pkcs7-mime; smime-type=signed-data; name="smime.p7m"
+#   application/x-pkcs7-mime; smime-type=signed-data
+#
+# CIFRADO (S/MIME enveloped-data — caso real de laboratorio):
+#   application/pkcs7-mime; name="smime.p7m"; smime-type=enveloped-data
+#   application/pkcs7-mime; smime-type=enveloped-data
+#   application/x-pkcs7-mime; smime-type=enveloped-data
+#   application/pkcs7-mime; name="smime.p7m"  (sin smime-type, algunos clientes)
+#
+# COMPRIMIDO (muy raro):
+#   application/pkcs7-mime; smime-type=compress-data
+# ─────────────────────────────────────────────────────────────
+
+def classify_content_type(ct: str) -> dict:
+    """
+    Clasifica el correo segun el campo content-type del Email Trigger (modo Simple).
+    Retorna dict con campos: firmado, firma_valida, cifrado, descifrado_ok,
+                             error_codigo, estado.
+    """
+    ct_lower = (ct or "").lower().strip()
+
+    result = {
+        "firmado": False, "firma_valida": False,
+        "cifrado": False, "descifrado_ok": False,
+        "error_codigo": None, "estado": "TEXTO_PLANO",
+    }
+
+    # Extraer smime-type si existe
+    smime_type_val = ""
+    if "smime-type=" in ct_lower:
+        try:
+            smime_type_val = ct_lower.split("smime-type=")[1].split(";")[0].strip().strip('"')
+        except Exception:
+            pass
+
+    # Extraer protocol si existe
+    protocol_val = ""
+    if "protocol=" in ct_lower:
+        try:
+            protocol_val = ct_lower.split("protocol=")[1].split(";")[0].strip().strip('"\'')
+        except Exception:
+            pass
+
+    # ── CASO: application/pkcs7-mime o application/x-pkcs7-mime ──
+    is_pkcs7_mime = (
+        "application/pkcs7-mime" in ct_lower or
+        "application/x-pkcs7-mime" in ct_lower
+    )
+    if is_pkcs7_mime:
+        if smime_type_val == "signed-data":
+            # Firma opaca (signed-data), Outlook legacy
+            result["firmado"] = True
+            result["error_codigo"] = "OPAQUE_SIGNED_SIMPLE_MODE"
+            result["estado"] = "FIRMADO"
+        else:
+            # enveloped-data (cifrado), compress-data, o sin smime-type
+            result["cifrado"] = True
+            result["error_codigo"] = "ENCRYPTED_NO_PRIVATE_KEY"
+            result["estado"] = "CIFRADO"
+        return result
+
+    # ── CASO: multipart/signed (firma detached — el mas comun) ──
+    if "multipart/signed" in ct_lower:
+        result["firmado"] = True
+        if "pkcs7-signature" in protocol_val or "pkcs7-signature" in ct_lower:
+            result["error_codigo"] = "SIGNED_DETECTED_SIMPLE_MODE"
+            result["estado"] = "FIRMADO"
+        else:
+            # PGP/MIME u otro
+            result["error_codigo"] = "UNSUPPORTED_SIGNATURE_PROTOCOL"
+            result["estado"] = "FIRMADO"
+        return result
+
+    # ── CASO: TEXTO PLANO (todo lo demas) ──
+    # text/plain, text/html, multipart/alternative,
+    # multipart/mixed, multipart/related, etc.
+    result["estado"] = "TEXTO_PLANO"
+    return result
+
+
+def build_msg_id(data: dict) -> str:
+    mid = (data.get("messageId") or data.get("message-id") or
+           data.get("id") or "")
+    mid = str(mid).strip().strip("<>")
+    if not mid:
+        seed = f"{data.get('from','')}{data.get('date','')}{data.get('subject','')}"
+        mid = "noid-" + hashlib.sha256(seed.encode()).hexdigest()[:20]
+    return mid
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "ts": datetime.utcnow().isoformat()})
+
+
+@app.route("/verify-email", methods=["POST"])
+def verify_email():
+    """
+    Recibe el JSON del nodo HTTP Request de n8n (Email Trigger modo Simple).
+    Campos esperados:
+      contentType  → {{ $json["content-type"] }}
+      from         → {{ $json["from"] }}
+      to           → {{ $json["to"] }}
+      subject      → {{ $json["subject"] }}
+      messageId    → {{ $json["messageId"] }}
+    """
+    ct_header = request.content_type or ""
+    if "application/json" in ct_header:
+        data = request.get_json(force=True, silent=True) or {}
+    else:
+        try:
+            data = json.loads(request.get_data(as_text=True))
+        except Exception:
+            data = request.form.to_dict() or {}
+
+    if not data:
+        return jsonify({"error": "empty_body"}), 400
+
+    content_type_val = (
+        data.get("contentType") or data.get("content-type") or
+        data.get("Content-Type") or ""
+    )
+    frm     = data.get("from", "") or ""
+    to      = data.get("to",   "") or ""
+    subject = data.get("subject", "") or ""
+    msg_id  = build_msg_id(data)
+
+    smime = classify_content_type(content_type_val)
+
+    db = get_db()
+    try:
+        db.execute("""
+            INSERT INTO EVENTOS_CORREO
+              (remitente, destinatario, msg_id, firmado, firma_valida,
+               cifrado, descifrado_ok, error_codigo, fuente, subject)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (frm, to, msg_id,
+              int(smime["firmado"]), int(smime["firma_valida"]),
+              int(smime["cifrado"]), int(smime["descifrado_ok"]),
+              smime["error_codigo"], "n8n-simple", subject))
+        db.commit()
+        inserted = True
+    except sqlite3.IntegrityError:
+        db.execute("""
+            UPDATE EVENTOS_CORREO
+            SET remitente=?, destinatario=?, firmado=?, firma_valida=?,
+                cifrado=?, descifrado_ok=?, error_codigo=?, fuente=?, subject=?
+            WHERE msg_id=?
+        """, (frm, to,
+              int(smime["firmado"]), int(smime["firma_valida"]),
+              int(smime["cifrado"]), int(smime["descifrado_ok"]),
+              smime["error_codigo"], "n8n-simple", subject, msg_id))
+        db.commit()
+        inserted = False
+
+    return jsonify({
+        "msg_id": msg_id, "remitente": frm, "destinatario": to,
+        "subject": subject, "content_type": content_type_val,
+        "estado": smime["estado"], "firmado": smime["firmado"],
+        "firma_valida": smime["firma_valida"], "cifrado": smime["cifrado"],
+        "descifrado_ok": smime["descifrado_ok"],
+        "error_codigo": smime["error_codigo"], "inserted": inserted,
+    })
+
+
+@app.route("/dashboard")
+def dashboard():
+    db = get_db()
+    row = db.execute("""
+        SELECT COUNT(*) as total,
+          SUM(firmado) as firmados, SUM(firma_valida) as firmas_validas,
+          SUM(cifrado) as cifrados,
+          SUM(CASE WHEN firmado=0 AND cifrado=0 THEN 1 ELSE 0 END) as texto_plano,
+          SUM(CASE WHEN firmado=1 AND cifrado=0 THEN 1 ELSE 0 END) as errores
+        FROM EVENTOS_CORREO
+    """).fetchone()
+    total        = row["total"] or 0
+    firmados     = row["firmados"] or 0
+    cifrados     = row["cifrados"] or 0
+    texto_plano  = row["texto_plano"] or 0
+    errores      = row["errores"] or 0
+    pct_firmados = round(firmados * 100 / total, 1) if total else 0
+    pct_cifrados = round(cifrados * 100 / total, 1) if total else 0
+    eventos = db.execute("""
+        SELECT id, remitente, destinatario, subject, fecha_hora,
+               firmado, firma_valida, cifrado, descifrado_ok, error_codigo
+        FROM EVENTOS_CORREO ORDER BY id DESC LIMIT 20
+    """).fetchall()
+    alertas = db.execute("""
+        SELECT COUNT(*) as cnt FROM EVENTOS_CORREO
+        WHERE firmado=0 AND cifrado=0
+        AND fecha_hora >= datetime('now','-24 hours')
+    """).fetchone()["cnt"]
+    certs_por_vencer = db.execute("""
+        SELECT sujeto_cn, email, vence FROM CERTIFICADOS
+        WHERE date(vence) <= date('now','+30 days') AND estado='valido'
+    """).fetchall()
+    tendencia = db.execute("""
+        SELECT date(fecha_hora) as dia, COUNT(*) as total,
+               SUM(firmado) as firmados, SUM(cifrado) as cifrados
+        FROM EVENTOS_CORREO
+        WHERE fecha_hora >= datetime('now','-7 days')
+        GROUP BY dia ORDER BY dia
+    """).fetchall()
+    return render_template("dashboard.html",
+        total=total, firmados=firmados, cifrados=cifrados,
+        texto_plano=texto_plano, errores=errores,
+        pct_firmados=pct_firmados, pct_cifrados=pct_cifrados,
+        eventos=eventos, alertas=alertas,
+        certs_por_vencer=certs_por_vencer,
+        tendencia=json.dumps([dict(r) for r in tendencia]))
+
+
+@app.route("/asistente")
+def asistente():
+    return render_template("asistente.html")
+
+
+@app.route("/generar-certificado", methods=["POST"])
+def generar_certificado():
+    data   = request.get_json(force=True, silent=True) or request.form
+    cn     = (data.get("cn") or "").strip()
+    email_ = (data.get("email") or "").strip()
+    pin    = (data.get("pin") or "changeit").strip()
+    days   = int(data.get("days") or 365)
+    if not cn or not email_:
+        return jsonify({"error": "cn y email son requeridos"}), 400
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
+        x509.NameAttribute(NameOID.COMMON_NAME, cn),
+        x509.NameAttribute(NameOID.EMAIL_ADDRESS, email_),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject).issuer_name(subject).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.utcnow())
+        .not_valid_after(datetime.utcnow() + timedelta(days=days))
+        .add_extension(x509.SubjectAlternativeName([x509.RFC822Name(email_)]), critical=False)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, content_commitment=True, key_encipherment=True,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False,
+            crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+        .add_extension(x509.ExtendedKeyUsage(
+            [x509.oid.ExtendedKeyUsageOID.EMAIL_PROTECTION]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    p12 = pkcs12.serialize_key_and_certificates(
+        name=cn.encode(), key=key, cert=cert, cas=None,
+        encryption_algorithm=serialization.BestAvailableEncryption(pin.encode()))
+    fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+    serie = str(cert.serial_number)
+    try:
+        vence = cert.not_valid_after_utc.date().isoformat()
+    except AttributeError:
+        vence = cert.not_valid_after.date().isoformat()
+    db = get_db()
+    try:
+        db.execute("""
+            INSERT OR REPLACE INTO CERTIFICADOS
+              (sujeto_cn, emisor, serie, vence, estado, email, huella_sha256, fuente)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (cn, cn, serie, vence, "valido", email_, fingerprint, "asistente"))
+        db.commit()
+    except Exception:
+        pass
+    return send_file(io.BytesIO(p12), mimetype="application/x-pkcs12",
+                     as_attachment=True, download_name=f"{cn.replace(' ','_')}.p12")
+
+
+@app.route("/api/stats")
+def api_stats():
+    db = get_db()
+    row = db.execute("""
+        SELECT COUNT(*) as total, SUM(firmado) as firmados,
+               SUM(cifrado) as cifrados,
+               SUM(CASE WHEN firmado=0 AND cifrado=0 THEN 1 ELSE 0 END) as texto_plano
+        FROM EVENTOS_CORREO
+    """).fetchone()
+    return jsonify(dict(row))
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=False)
