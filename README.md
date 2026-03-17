@@ -90,6 +90,25 @@ docker compose up -d
 docker compose ps
 ```
 
+#### 6. Configuración inicial de la Autoridad Certificante (CA)  con OpenSSL
+
+```bash
+# Generar la Clave Privada de la CA
+# Esta es la "llave maestra" de nuestra CA. Es secreta y debe estar protegida por contraseña.
+openssl genpkey -algorithm RSA -out CA_Key.pem -aes256 -pkeyopt rsa_keygen_bits:4096
+
+#  Generar el Certificado Raíz (Público) de la CA
+openssl req -x509 -new \
+-key CA_Key.pem \
+-sha256 \
+-days 3650 \
+-out CA_Cert.pem \
+-subj "/C=AR/ST=CABA/L=CABA/O=Universidad Siglo 21/CN=CATFG" \
+-addext "basicConstraints=critical,CA:TRUE" \
+-addext "keyUsage=critical,keyCertSign,cRLSign"
+```
+
+
 ---
 
 ### Accesos y URLs
