@@ -81,16 +81,17 @@ def init_db():
 #   application/pkcs7-mime; smime-type=signed-data; name="smime.p7m"
 #   application/x-pkcs7-mime; smime-type=signed-data
 #
+# CIFRADO (S/MIME enveloped-data — caso real de laboratorio):
+#   application/pkcs7-mime; name="smime.p7m"; smime-type=enveloped-data
+#   application/pkcs7-mime; smime-type=enveloped-data
+#   application/x-pkcs7-mime; smime-type=enveloped-data
+#   application/pkcs7-mime; name="smime.p7m"  (sin smime-type, algunos clientes)
+#
 # CIFRADO Y FIRMADO (sign-then-encrypt, RFC 8551 seccion 3.3):
 #   El content-type exterior es enveloped-data; la firma viaja dentro
 #   del sobre cifrado como signed-data. Sin clave privada del receptor
 #   no es posible descifrar y verificar, pero por convencion del RFC
 #   se asume que enveloped-data contiene firma interior (sign-then-encrypt).
-#
-#   application/pkcs7-mime; name="smime.p7m"; smime-type=enveloped-data
-#   application/pkcs7-mime; smime-type=enveloped-data
-#   application/x-pkcs7-mime; smime-type=enveloped-data
-#   application/pkcs7-mime; name="smime.p7m"  (sin smime-type, algunos clientes)
 #
 # COMPRIMIDO (muy raro):
 #   application/pkcs7-mime; smime-type=compress-data
@@ -135,17 +136,14 @@ def classify_content_type(ct: str) -> dict:
         if smime_type_val == "signed-data":
             # Firma opaca (signed-data), Outlook legacy
             result["firmado"] = True
-            result["firma_valida"] = True
-            result["error_codigo"] = None
+            result["error_codigo"] = "OPAQUE_SIGNED_SIMPLE_MODE"
             result["estado"] = "FIRMADO"
         else:
             # enveloped-data (cifrado con firma interior sign-then-encrypt)
             # RFC 8551 sec 3.3: el sobre cifrado contiene signed-data interior
             result["cifrado"] = True
-            result["descifrado_ok"] = True
             result["firmado"] = True
-            result["firma_valida"] = True
-            result["error_codigo"] = None
+            result["error_codigo"] = "ENCRYPTED_SIGNED_ASSUMED"
             result["estado"] = "CIFRADO_Y_FIRMADO"
         return result
 
@@ -153,8 +151,7 @@ def classify_content_type(ct: str) -> dict:
     if "multipart/signed" in ct_lower:
         result["firmado"] = True
         if "pkcs7-signature" in protocol_val or "pkcs7-signature" in ct_lower:
-            result["firma_valida"] = True
-            result["error_codigo"] = None
+            result["error_codigo"] = "SIGNED_DETECTED_SIMPLE_MODE"
             result["estado"] = "FIRMADO"
         else:
             # PGP/MIME u otro

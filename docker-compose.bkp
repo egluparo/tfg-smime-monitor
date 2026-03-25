@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   n8n:
     image: n8nio/n8n:latest
@@ -6,17 +7,18 @@ services:
     ports:
       - "5678:5678"
     environment:
-      - N8N_HOST=n8n.luparo.com.ar
+      - N8N_HOST=luparo.com.ar
       - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://n8n.luparo.com.ar/
-      - N8N_SECURE_COOKIE=true
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://luparo.com.ar:5678/
+      - N8N_SECURE_COOKIE=false
       - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
       - TZ=America/Argentina/Buenos_Aires
     volumes:
       - ./n8n_data:/home/node/.n8n
     networks:
       - smime_net
+
   api-smime:
     build: ./api
     restart: always
@@ -28,6 +30,7 @@ services:
       - smime_net
     depends_on:
       - n8n
+
 networks:
   smime_net:
     driver: bridge
