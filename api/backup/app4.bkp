@@ -14,34 +14,6 @@ import io
 app = Flask(__name__)
 DB_PATH = os.environ.get("DB_PATH", "/app/data/tfg_security.db")
 
-# ─────────────────────────────────────────────────────────────
-# CA local — se cargan al arrancar la app
-# ─────────────────────────────────────────────────────────────
-CA_CERT_PATH = os.environ.get("CA_CERT_PATH", "/app/data/ca/Test_CA_Cert.pem")
-CA_KEY_PATH  = os.environ.get("CA_KEY_PATH",  "/app/data/ca/Test_CA_Key.pem")
-CA_KEY_PASS  = os.environ.get("CA_KEY_PASS",  "")
-
-_ca_cert = None
-_ca_key  = None
-
-def load_ca():
-    """Carga el certificado y clave privada de la CA local."""
-    global _ca_cert, _ca_key
-    try:
-        with open(CA_CERT_PATH, "rb") as f:
-            _ca_cert = x509.load_pem_x509_certificate(f.read())
-        passphrase = CA_KEY_PASS.encode() if CA_KEY_PASS else None
-        with open(CA_KEY_PATH, "rb") as f:
-            _ca_key = serialization.load_pem_private_key(f.read(), password=passphrase)
-        app.logger.info("CA local cargada correctamente: %s", CA_CERT_PATH)
-    except Exception as e:
-        app.logger.warning("No se pudo cargar la CA local (%s). "
-                           "El asistente generara certificados autofirmados. "
-                           "Error: %s", CA_CERT_PATH, e)
-        _ca_cert = None
-        _ca_key = None
-
-
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
@@ -344,33 +316,15 @@ def generar_certificado():
     days   = int(data.get("days") or 365)
     if not cn or not email_:
         return jsonify({"error": "cn y email son requeridos"}), 400
-
-    # Generar clave privada del usuario
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
     subject = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, "AR"),
         x509.NameAttribute(NameOID.COMMON_NAME, cn),
         x509.NameAttribute(NameOID.EMAIL_ADDRESS, email_),
     ])
-
-    # Determinar si se firma con CA local o autofirmado (fallback)
-    if _ca_cert and _ca_key:
-        issuer_name = _ca_cert.subject
-        signing_key = _ca_key
-        issuer_cn = _ca_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-        ca_chain = [_ca_cert]
-    else:
-        issuer_name = subject
-        signing_key = key
-        issuer_cn = cn
-        ca_chain = None
-
     cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer_name)
-        .public_key(key.public_key())
+        .subject_name(subject).issuer_name(subject).public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.utcnow())
         .not_valid_after(datetime.utcnow() + timedelta(days=days))
@@ -381,32 +335,27 @@ def generar_certificado():
             crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
         .add_extension(x509.ExtendedKeyUsage(
             [x509.oid.ExtendedKeyUsageOID.EMAIL_PROTECTION]), critical=False)
-        .sign(signing_key, hashes.SHA256())
+        .sign(key, hashes.SHA256())
     )
-
-    # Empaquetar .p12 con cadena de CA si esta disponible
     p12 = pkcs12.serialize_key_and_certificates(
-        name=cn.encode(), key=key, cert=cert, cas=ca_chain,
+        name=cn.encode(), key=key, cert=cert, cas=None,
         encryption_algorithm=serialization.BestAvailableEncryption(pin.encode()))
-
     fingerprint = cert.fingerprint(hashes.SHA256()).hex()
     serie = str(cert.serial_number)
     try:
         vence = cert.not_valid_after_utc.date().isoformat()
     except AttributeError:
         vence = cert.not_valid_after.date().isoformat()
-
     db = get_db()
     try:
         db.execute("""
             INSERT OR REPLACE INTO CERTIFICADOS
               (sujeto_cn, emisor, serie, vence, estado, email, huella_sha256, fuente)
             VALUES (?,?,?,?,?,?,?,?)
-        """, (cn, issuer_cn, serie, vence, "valido", email_, fingerprint, "asistente"))
+        """, (cn, cn, serie, vence, "valido", email_, fingerprint, "asistente"))
         db.commit()
     except Exception:
         pass
-
     return send_file(io.BytesIO(p12), mimetype="application/x-pkcs12",
                      as_attachment=True, download_name=f"{cn.replace(' ','_')}.p12")
 
@@ -425,5 +374,4 @@ def api_stats():
 
 if __name__ == "__main__":
     init_db()
-    load_ca()
     app.run(host="0.0.0.0", port=5000, debug=False)

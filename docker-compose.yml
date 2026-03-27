@@ -22,6 +22,8 @@ services:
     restart: always
     ports:
       - "5000:5000"
+    env_file: 
+      - .env    
     volumes:
       - ./api/data:/app/data
     networks:

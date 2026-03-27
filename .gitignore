@@ -20,3 +20,7 @@ n8n_data/
 
 # Logs
 *.log
+
+# CA y variables de entorno
+api/data/ca
+.env
