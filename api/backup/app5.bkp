@@ -311,12 +311,8 @@ def dashboard():
         AND fecha_hora >= datetime('now','-24 hours')
     """).fetchone()["cnt"]
     certs_por_vencer = db.execute("""
-        SELECT sujeto_cn, emisor, email, vence, estado,
-               CAST(julianday(vence) - julianday('now') AS INTEGER) as dias_restantes
-        FROM CERTIFICADOS
-        WHERE estado='valido'
-        ORDER BY date(vence) ASC
-        LIMIT 10
+        SELECT sujeto_cn, email, vence FROM CERTIFICADOS
+        WHERE date(vence) <= date('now','+30 days') AND estado='valido'
     """).fetchall()
     tendencia = db.execute("""
         SELECT date(fecha_hora) as dia, COUNT(*) as total,
@@ -330,7 +326,7 @@ def dashboard():
         texto_plano=texto_plano, errores=errores,
         pct_firmados=pct_firmados, pct_cifrados=pct_cifrados,
         eventos=eventos, alertas=alertas,
-        certs_por_vencer=[dict(r) for r in certs_por_vencer],
+        certs_por_vencer=certs_por_vencer,
         tendencia=json.dumps([dict(r) for r in tendencia]))
 
 
